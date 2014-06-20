@@ -252,7 +252,6 @@ transform_options(SrcDir, Options) ->
 %% than whatever application we may be running.
 get_system_modules() ->
     Apps = [
-        appmon,
         asn1,
         common_test,
         compiler,
