@@ -661,11 +661,12 @@ exclude_modules_to_scan(Modules) ->
         {ok, ExcludedModules} when is_list(ExcludedModules) andalso
                                    ExcludedModules =/= []->
             lists:foldl(fun(Module, Acc) ->
-                                case module_matches(Module, ExcludedModules) of
-                                    true ->
-                                        Acc;
-                                    false ->
-                                        [Module | Acc]
+                                case string:str(atom_to_list(Module), "Elixir.") of
+                                    0 -> case module_matches(Module, ExcludedModules) of
+                                            true -> Acc;
+                                            false -> [Module | Acc]
+                                        end;
+                                    _ -> Acc
                                 end
                         end, [], Modules);
         _ ->
