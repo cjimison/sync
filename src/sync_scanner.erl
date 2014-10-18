@@ -9,7 +9,9 @@
     start_link/0,
     rescan/0,
     info/0,
-    enable_patching/0
+    enable_patching/0,
+    pause/0,
+    unpause/0
 ]).
 
 %% gen_server callbacks
@@ -41,7 +43,8 @@
     src_file_lastmod,
     hrl_file_lastmod,
     timers,
-    patching = false
+    patching = false,
+    paused = false
 }).
 
 start_link() ->
@@ -57,6 +60,16 @@ rescan() ->
     gen_server:cast(?SERVER, compare_hrl_files),
     ok.
 
+unpause() ->
+    gen_server:cast(?SERVER, unpause),
+    ok.
+
+pause() ->
+    sync_notify:log_success("Pausing Sync. Call sync:go() to restart~n"),
+    sync_notify:growl_success("Pausing Sync"),
+    gen_server:cast(?SERVER, pause),
+    ok.
+
 info() ->
     io:format("Sync Info...~n"),
     gen_server:cast(?SERVER, info),
@@ -64,12 +77,12 @@ info() ->
 
 set_growl(T) when ?LOG_OR_GROWL_ON(T) ->
     sync_utils:set_env(growl,all),
-    growl_success("Sync","Desktop Notifications Enabled"),
+    sync_notify:growl_success("Sync","Desktop Notifications Enabled"),
     sync_utils:set_env(growl,T),
     ok;
 set_growl(F) when ?LOG_OR_GROWL_OFF(F) ->
     sync_utils:set_env(growl,all),
-    growl_success("Sync","Desktop Notifications Disabled"),
+    sync_notify:growl_success("Sync","Desktop Notifications Disabled"),
     sync_utils:set_env(growl,none),
     ok.
 
@@ -78,10 +91,10 @@ get_growl() ->
 
 set_log(T) when ?LOG_OR_GROWL_ON(T) ->
     sync_utils:set_env(log, T),
-    log_success("Console Notifications Enabled~n"),
+    sync_notify:log_success("Console Notifications Enabled~n"),
     ok;
 set_log(F) when ?LOG_OR_GROWL_OFF(F) ->
-    log_success("Console Notifications Disabled~n"),
+    sync_notify:log_success("Console Notifications Disabled~n"),
     sync_utils:set_env(log, none),
     ok.
 
@@ -101,9 +114,7 @@ init([]) ->
     rescan(),
 
     %% Display startup message...
-    case {get_growl(),os:type()} of
-        {true,{unix,_}} -> growl_success("Sync", "The Sync utility is now running.");
-        _ -> io:format("Growl notifications disabled~n") end,
+    sync_notify:startup(get_growl()),
 
     %% Create the state and return...
     State = #state {
@@ -123,6 +134,13 @@ handle_call(_Request, _From, State) ->
     Reply = ok,
     {reply, Reply, State}.
 
+handle_cast(pause, State) ->
+    {noreply, State#state {paused=true}};
+handle_cast(unpause, State) ->
+    {noreply, State#state {paused=false}};
+handle_cast(_, State) when State#state.paused==true ->
+    %% If paused, just absorb the request and do nothing
+    {noreply, State};
 handle_cast(discover_modules, State) ->
     %% Get a list of all loaded non-system modules.
     Modules = (erlang:loaded() -- sync_utils:get_system_modules()),
@@ -169,13 +187,13 @@ handle_cast(discover_src_dirs, State) ->
 handle_cast(discover_src_files, State) ->
     %% For each source dir, get a list of source files...
     F = fun(X, Acc) ->
-        sync_utils:wildcard(X, ".*\.erl$") ++ sync_utils:wildcard(X, ".*\.dtl$") ++ Acc
+        sync_utils:wildcard(X, ".*\\.erl$") ++ sync_utils:wildcard(X, ".*\\.dtl$") ++ Acc
     end,
     ErlFiles = lists:usort(lists:foldl(F, [], State#state.src_dirs)),
 
     %% For each include dir, get a list of hrl files...
     Fhrl = fun(X, Acc) ->
-        sync_utils:wildcard(X, ".*\.hrl$") ++ Acc
+        sync_utils:wildcard(X, ".*\\.hrl$") ++ Acc
     end,
     HrlFiles = lists:usort(lists:foldl(Fhrl, [], State#state.hrl_dirs)),
 
@@ -292,8 +310,8 @@ process_beam_lastmod([{Module, _}|T1], [{Module, _}|T2], EnablePatching, {FirstB
     Acc1 = case code:get_object_code(Module) of
         error ->
             Msg = io_lib:format("Error loading object code for ~p~n", [Module]),
-            log_errors(Msg),
-            growl_errors(Msg),
+            sync_notify:log_errors(Msg),
+            sync_notify:growl_errors(Msg),
             {FirstBeam, OtherBeams};
 
         {Module, Binary, Filename} ->
@@ -305,11 +323,11 @@ process_beam_lastmod([{Module, _}|T1], [{Module, _}|T2], EnablePatching, {FirstB
                 true ->
                     {ok, NumNodes} = load_module_on_all_nodes(Module),
                     Msg = io_lib:format("~s: Reloaded on ~p nodes! (Beam changed.)~n", [Module, NumNodes]),
-                    log_success(Msg);
+                    sync_notify:log_success(Msg);
                 false ->
                     %% Print a status message...
                     Msg = io_lib:format("~s: Reloaded! (Beam changed.)~n", [Module]),
-                    log_success(Msg)
+                    sync_notify:log_success(Msg)
             end,
             case FirstBeam of
                undefined -> {Module, OtherBeams};
@@ -337,12 +355,12 @@ process_beam_lastmod([], [], EnablePatching, Acc) ->
             nop; % nothing changed
         {FirstBeam, []} ->
             %% Print a status message...
-            growl_success("Reloaded " ++ atom_to_list(FirstBeam) ++ MsgAdd),
+            sync_notify:growl_success("Reloaded " ++ atom_to_list(FirstBeam) ++ MsgAdd),
             fire_onsync([FirstBeam]);
 
         {FirstBeam, N} ->
             %% Print a status message...
-            growl_success("Reloaded " ++ atom_to_list(FirstBeam) ++
+            sync_notify:growl_success("Reloaded " ++ atom_to_list(FirstBeam) ++
                               " and " ++ integer_to_list(erlang:length(N)) ++ " other beam files" ++ MsgAdd),
             fire_onsync([FirstBeam | N])
     end,
@@ -380,7 +398,7 @@ load_module_on_all_nodes(Module) ->
     F = fun(Node) ->
         io:format("[~s:~p] DEBUG - Node: ~p~n", [?MODULE, ?LINE, Node]),
         Msg = io_lib:format("Reloading '~s' on ~s.~n", [Module, Node]),
-        log_success(Msg),
+        sync_notify:log_success(Msg),
         rpc:call(Node, code, ensure_loaded, [Module]),
         case rpc:call(Node, code, which, [Module]) of
             Filename when is_binary(Filename) orelse is_list(Filename) ->
@@ -392,7 +410,7 @@ load_module_on_all_nodes(Module) ->
                 %% File doesn't exist, just load into VM.
                 {module, Module} = rpc:call(Node, code, load_binary, [Module, undefined, Binary])
         end,
-        growl_success("Reloaded " ++ atom_to_list(Module) ++ " on " ++ atom_to_list(Node) ++ ".")
+        sync_notify:growl_success("Reloaded " ++ atom_to_list(Module) ++ " on " ++ atom_to_list(Node) ++ ".")
     end,
     [F(X) || X <- Nodes],
     {ok, NumNodes}.
@@ -444,21 +462,29 @@ maybe_recompile_src_file(File, LastMod, EnablePatching) ->
             recompile_src_file(File, EnablePatching)
     end.
 
+determine_compile_fun_and_module_name(SrcFile) ->
+    case sync_utils:is_erlydtl_template(SrcFile) of
+         false ->
+            {fun compile:file/2,
+             list_to_atom(filename:basename(SrcFile, ".erl"))};
+         true ->
+            {fun erlydtl_compile/2,
+             list_to_atom(lists:flatten(filename:basename(SrcFile, ".dtl") ++ "_dtl"))}
+     end.
+
+get_object_code(Module) ->
+    case code:get_object_code(Module) of
+        {Module, B, _Filename} -> B;
+        _ -> undefined
+    end.
 
 recompile_src_file(SrcFile, _EnablePatching) ->
     %% Get the module, src dir, and options...
     {ok, SrcDir} = sync_utils:get_src_dir(SrcFile),
-
-    {CompileFun, Module} = case sync_utils:is_erlydtl_template(SrcFile) of
-         false -> {fun compile:file/2, list_to_atom(filename:basename(SrcFile, ".erl"))};
-         true -> {fun erlydtl_compile/2, list_to_atom(lists:flatten(filename:basename(SrcFile, ".dtl") ++ "_dtl"))}
-     end,
+    {CompileFun, Module} = determine_compile_fun_and_module_name(SrcFile),
 
     %% Get the old binary code...
-    OldBinary = case code:get_object_code(Module) of
-        {Module, B, _Filename} -> B;
-        _ -> undefined
-    end,
+    OldBinary = get_object_code(Module),
 
     case sync_options:get_options(SrcDir) of
         {ok, Options} ->
@@ -494,7 +520,7 @@ recompile_src_file(SrcFile, _EnablePatching) ->
 
         undefined ->
             Msg = io_lib:format("Unable to determine options for ~p", [SrcFile]),
-            log_errors(Msg)
+            sync_notify:log_errors(Msg)
     end.
 
 
@@ -504,24 +530,24 @@ print_results(Module, SrcFile, [], []) ->
         {file, _} ->
             ok;
         false ->
-            growl_success("Recompiled " ++ SrcFile ++ ".")
+            sync_notify:growl_success("Recompiled " ++ SrcFile ++ ".")
     end,
-    log_success(lists:flatten(Msg));
+    sync_notify:log_success(lists:flatten(Msg));
 
 print_results(_Module, SrcFile, [], Warnings) ->
     Msg = [
         format_errors(SrcFile, [], Warnings),
         io_lib:format("~s:0: Recompiled with ~p warnings~n", [SrcFile, length(Warnings)])
     ],
-    growl_warnings(growl_format_errors([], Warnings)),
-    log_warnings(Msg);
+    sync_notify:growl_warnings(growl_format_errors([], Warnings)),
+    sync_notify:log_warnings(Msg);
 
 print_results(_Module, SrcFile, Errors, Warnings) ->
     Msg = [
         format_errors(SrcFile, Errors, Warnings)
     ],
-    growl_errors(growl_format_errors(Errors, Warnings)),
-    log_errors(Msg).
+    sync_notify:growl_errors(growl_format_errors(Errors, Warnings)),
+    sync_notify:log_errors(Msg).
 
 
 %% @private Print error messages in a pretty and user readable way.
@@ -549,127 +575,6 @@ growl_format_errors(Errors, Warnings) ->
         io_lib:format("~p: ~s: ~s~n", [Line, Prefix, Msg])
     end,
     [F(X) || X <- Everything].
-
-growl(Image, Title, Message) ->
-    ImagePath = filename:join([filename:dirname(code:which(sync)), "..", "icons", Image]) ++ ".png",
-    Cmd = case sync_utils:get_env(executable, auto) of
-              auto ->
-                  case os:type() of
-                      {win32, _} ->
-                          make_cmd("notifu", Image, Title, Message);
-                      {unix,linux} ->
-                          make_cmd("notify-send", ImagePath, Title, Message);
-                      _ ->
-                          make_cmd("growlnotify", ImagePath, Title, Message)
-                  end;
-              Executable ->
-                  make_cmd(Executable, Image, Title, Message)
-          end,
-    os:cmd(lists:flatten(Cmd)).
-
-make_cmd(Util, Image, Title, Message) when is_atom(Util) ->
-    make_cmd(atom_to_list(Util), Image, Title, Message);
-
-make_cmd("growlnotify" = Util, Image, Title, Message) ->
-    [Util, " -n \"Sync\" --image \"", Image,"\"",
-     " -m \"", Message, "\" \"", Title, "\""];
-
-make_cmd("notification_center" = _Util, _Image, Title, Message) ->
-    AppleScript = io_lib:format("display notification \"~s\" with title \"~s\"", [Message, Title]),
-    io_lib:format("osascript -e '~s'", [AppleScript]);
-
-make_cmd("notify-send" = Util, Image, Title, Message) ->
-    [Util, " -i \"", Image, "\"",
-     " \"", Title, "\" \"", Message, "\" --expire-time=5000"];
-
-make_cmd("notifu" = Util, Image, Title, Message) ->
-    %% see http://www.paralint.com/projects/notifu/
-    [Util, " /q /d 5000 /t ", image2notifu_type(Image), " ",
-     "/p \"", Title, "\" /m \"", Message, "\""];
-
-make_cmd("emacsclient" = Util, "warnings", Title, Message0) ->
-    Message = lisp_format(Message0),
-    io_lib:format("~s --eval \"(mapc (lambda (m) (lwarn \\\"sync: ~s\\\" :warning m)) (list ~s))\"",
-                  [Util, Title, Message]);
-make_cmd("emacsclient" = Util, "errors", Title, Message0) ->
-    Message = lisp_format(Message0),
-    io_lib:format("~s --eval \"(mapc (lambda (m) (lwarn \\\"sync: ~s\\\" :error m)) (list ~s))\"",
-                  [Util, Title, Message]);
-make_cmd("emacsclient" = Util, _, Title, Message0) ->
-    Message = replace_chars(Message0, [{$\n, "\\n"}]),
-    io_lib:format("~s --eval \"(message \\\"[sync] ~s: ~s\\\")\"",
-                  [Util, Title, Message]);
-
-make_cmd(UnsupportedUtil, _, _, _) ->
-    error('unsupported-sync-executable',
-           lists:flatten(io_lib:format("'sync' application environment variable "
-                                       "named 'executable' has unsupported value: ~p",
-                                       [UnsupportedUtil]))).
-
-image2notifu_type("success") -> "info";
-image2notifu_type("warnings") -> "warn";
-image2notifu_type("errors") -> "error".
-
-growl_success(Message) ->
-    growl_success("Success!", Message).
-
-growl_success(Title, Message) ->
-    can_we_growl(success)
-        andalso growl("success", Title, Message).
-
-growl_errors(Message) ->
-    can_we_growl(errors)
-        andalso growl("errors", "Errors...", Message).
-
-growl_warnings(Message) ->
-    can_we_growl(warnings)
-        andalso growl("warnings", "Warnings", Message).
-
-log_success(Message) ->
-    can_we_log(success)
-        andalso error_logger:info_msg(lists:flatten(Message)).
-
-log_errors(Message) ->
-    can_we_log(errors)
-        andalso error_logger:error_msg(lists:flatten(Message)).
-
-log_warnings(Message) ->
-    can_we_log(warnings)
-        andalso error_logger:warning_msg(lists:flatten(Message)).
-
-can_we_growl(MsgType) ->
-    can_we_notify(growl, MsgType).
-
-can_we_log(MsgType) ->
-    can_we_notify(log, MsgType).
-
-can_we_notify(GrowlOrLog,MsgType) ->
-    case sync_utils:get_env(GrowlOrLog, all) of
-        true              -> true;
-        all               -> true;
-        none              -> false;
-        false             -> false;
-        skip_success      -> MsgType==errors orelse MsgType==warnings;
-        L when is_list(L) -> lists:member(MsgType, L);
-        _                 -> false
-    end.
-
-%% Return a new string with chars replaced.
-%% @spec replace_chars(iolist(), [{char(), char() | string()}] -> iolist().
-replace_chars(String, Tab) ->
-    lists:map(fun (C) ->
-                      proplists:get_value(C, Tab, C)
-              end,
-              lists:flatten(String)).
-
-%% Return a new string constructed of source lines double quoted and
-%% delimited by space.
-%% spec lisp_format(StringOfLines :: iolist()) -> string().
-lisp_format(String0) ->
-    String1 = lists:flatten(String0),
-    Lines1 = string:tokens(String1, [$\n]),
-    String2 = string:join(Lines1, "\\\" \\\""),
-    lists:flatten(["\\\"", String2, "\\\""]).
 
 process_hrl_file_lastmod([{File, LastMod}|T1], [{File, LastMod}|T2], SrcFiles, Patching) ->
     %% Hrl hasn't changed, do nothing...
@@ -729,20 +634,53 @@ is_include(HrlFile, [{tree, attribute, _, {attribute, _, [{_, _, IncludeFile}]}}
 is_include(HrlFile, [_SomeForm | Forms]) ->
     is_include(HrlFile, Forms).
 
-%% @private Filter the excluded modules.
+%% @private Filter the modules to be scanned.
 filter_modules_to_scan(Modules) ->
+    exclude_modules_to_scan(whitelist_modules_to_scan(Modules)).
+
+%% @private Filter the whitelisted modules.
+whitelist_modules_to_scan(Modules) ->
+    case application:get_env(sync, whitelisted_modules) of
+        {ok, WhitelistedModules} when is_list(WhitelistedModules) andalso
+                                   WhitelistedModules =/= []->
+            lists:foldl(fun(Module, Acc) ->
+                                case module_matches(Module, WhitelistedModules) of
+                                    true ->
+                                        [Module | Acc];
+                                    false ->
+                                        Acc
+                                end
+                        end, [], Modules);
+        _ ->
+            Modules
+    end.
+
+%% @private Filter the excluded modules.
+exclude_modules_to_scan(Modules) ->
     case application:get_env(sync, excluded_modules) of
         {ok, ExcludedModules} when is_list(ExcludedModules) andalso
                                    ExcludedModules =/= []->
             lists:foldl(fun(Module, Acc) ->
-                                case lists:member(Module, ExcludedModules) of
+                                case module_matches(Module, ExcludedModules) of
                                     true ->
                                         Acc;
                                     false ->
                                         [Module | Acc]
                                 end
                         end, [], Modules);
-
         _ ->
             Modules
+    end.
+
+module_matches(_Module, []) ->
+    false;
+module_matches(Module, [Module2|T]) when is_atom(Module2) ->
+    case Module =:= Module2 of
+        true -> true;
+        false -> module_matches(Module, T)
+    end;
+module_matches(Module, [Pattern|T]) when is_list(Pattern) ->
+    case re:run(atom_to_list(Module), Pattern) of
+        {match, _} -> true;
+        nomatch -> module_matches(Module, T)
     end.
